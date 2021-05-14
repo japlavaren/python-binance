@@ -1,3 +1,4 @@
+import logging as global_logging
 from typing import Dict, Optional, List, Tuple
 
 import aiohttp
@@ -13,6 +14,8 @@ from urllib.parse import urlencode
 from .helpers import interval_to_milliseconds, convert_ts_str
 from .exceptions import BinanceAPIException, BinanceRequestException, NotImplementedException
 from .enums import HistoricalKlinesType
+
+logging = global_logging.getLogger(__name__)
 
 
 class BaseClient:
@@ -6468,8 +6471,14 @@ class AsyncClient(BaseClient):
     async def _request(self, method, uri: str, signed: bool, force_params: bool = False, **kwargs) -> Dict:
 
         kwargs = self._get_request_kwargs(method, signed, force_params, **kwargs)
+        logging.debug(f'> {method.upper()} {uri} {kwargs}')
 
         async with getattr(self.session, method)(uri, **kwargs) as response:
+            logging.debug(f'< {response.status} {await response.text()}')
+
+            if int(response.headers.get('x-mbx-used-weight', 0)) > 1000:
+                logging.warning(f'x-mbx-used-weight {response.headers["x-mbx-used-weight"]}')
+
             self.response = response
             return await self._handle_response(response)
 
