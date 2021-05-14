@@ -1,11 +1,11 @@
 import asyncio
 import gzip
 import json
-import logging
+import logging as global_logging
 import time
 from enum import Enum
 from random import random
-from typing import Optional, List, Dict, Callable, Any
+from typing import Awaitable, Optional, List, Dict, Callable, Any
 
 import websockets as ws
 
@@ -13,6 +13,8 @@ from .client import AsyncClient
 from .exceptions import BinanceWebsocketUnableToConnect
 from .enums import FuturesType
 from .threaded_stream import ThreadedApiManager
+
+logging = global_logging.getLogger(__name__)
 
 KEEPALIVE_TIMEOUT = 5 * 60  # 5 minutes
 
@@ -25,7 +27,6 @@ class WSListenerState(Enum):
 
 
 class ReconnectingWebsocket:
-
     MAX_RECONNECTS = 5
     MAX_RECONNECT_SECONDS = 60
     MIN_RECONNECT_WAIT = 0.1
@@ -33,15 +34,17 @@ class ReconnectingWebsocket:
     NO_MESSAGE_RECONNECT_TIMEOUT = 60
 
     def __init__(
-        self, loop, url: str, path: Optional[str] = None, prefix: str = 'ws/', is_binary: bool = False, exit_coro=None
+            self, loop, url: str, path: Optional[str] = None, prefix: str = 'ws/', is_binary: bool = False,
+            exit_coro=None,
+            after_reconnect: Optional[Callable[[], Awaitable[None]]] = None
     ):
         self._loop = loop or asyncio.get_event_loop()
-        self._log = logging.getLogger(__name__)
         self._path = path
         self._url = url
         self._exit_coro = exit_coro
         self._prefix = prefix
         self._reconnects = 0
+        self._after_reconnect = after_reconnect
         self._is_binary = is_binary
         self._conn = None
         self._socket = None
@@ -92,14 +95,19 @@ class ReconnectingWebsocket:
         try:
             return json.loads(evt)
         except ValueError:
-            self._log.debug(f'error parsing evt json:{evt}')
+            logging.debug(f'error parsing evt json:{evt}')
             return None
 
     async def recv(self):
         res = None
         while not res:
             if not self.ws or self.ws_state != WSListenerState.STREAMING:
+                logging.warning('reconnecting')
                 await self._wait_for_reconnect()
+                logging.info('reconnected')
+
+                if self._after_reconnect is not None:
+                    await self._after_reconnect()
                 break
             if self.ws_state == WSListenerState.EXITING:
                 break
@@ -107,6 +115,8 @@ class ReconnectingWebsocket:
                 res = await asyncio.wait_for(self.ws.recv(), timeout=self.TIMEOUT)
             except asyncio.TimeoutError:
                 logging.debug(f"no message in {self.TIMEOUT} seconds")
+
+                asyncio.create_task(self._reconnect())
             except asyncio.CancelledError as e:
                 logging.debug(f"cancelled error {e}")
             except asyncio.IncompleteReadError as e:
@@ -123,7 +133,6 @@ class ReconnectingWebsocket:
 
     async def _wait_for_reconnect(self):
         while self.ws_state == WSListenerState.RECONNECTING:
-            logging.debug("reconnecting waiting for connect")
             await asyncio.sleep(0.01)
         if not self.ws:
             logging.debug("ignore message no ws")
@@ -177,8 +186,11 @@ class ReconnectingWebsocket:
 
 class KeepAliveWebsocket(ReconnectingWebsocket):
 
-    def __init__(self, client: AsyncClient, loop, url, keepalive_type, prefix='ws/', is_binary=False, exit_coro=None, user_timeout=None):
-        super().__init__(loop=loop, path=None, url=url, prefix=prefix, is_binary=is_binary, exit_coro=exit_coro)
+    def __init__(self, client: AsyncClient, loop, url, keepalive_type, prefix='ws/', is_binary=False, exit_coro=None,
+                 user_timeout=None,
+                 after_reconnect: Optional[Callable[[], Awaitable[None]]] = None):
+        super().__init__(loop=loop, path=None, url=url, prefix=prefix, is_binary=is_binary, exit_coro=exit_coro,
+                         after_reconnect=after_reconnect)
         self._keepalive_type = keepalive_type
         self._client = client
         self._user_timeout = user_timeout or KEEPALIVE_TIMEOUT
@@ -300,7 +312,8 @@ class BinanceSocketManager:
         return self._conns[path]
 
     def _get_account_socket(
-        self, path: str, stream_url: Optional[str] = None, prefix: str = 'ws/', is_binary: bool = False
+            self, path: str, stream_url: Optional[str] = None, prefix: str = 'ws/', is_binary: bool = False,
+            after_reconnect: Optional[Callable[[], Awaitable[None]]] = None
     ):
         if path not in self._conns:
             self._conns[path] = KeepAliveWebsocket(
@@ -311,7 +324,8 @@ class BinanceSocketManager:
                 prefix=prefix,
                 exit_coro=self._exit_socket,
                 is_binary=is_binary,
-                user_timeout=self._user_timeout
+                user_timeout=self._user_timeout,
+                after_reconnect=after_reconnect,
             )
 
         return self._conns[path]
@@ -896,7 +910,7 @@ class BinanceSocketManager:
         path = f'streams={"/".join(streams)}'
         return self._get_futures_socket(path, prefix='stream?', futures_type=futures_type)
 
-    def user_socket(self):
+    def user_socket(self, after_reconnect: Optional[Callable[[], Awaitable[None]]] = None):
         """Start a websocket for user data
 
             https://github.com/binance-exchange/binance-official-api-docs/blob/master/user-data-stream.md
@@ -906,7 +920,7 @@ class BinanceSocketManager:
 
         Message Format - see Binance API docs for all types
         """
-        return self._get_account_socket('user')
+        return self._get_account_socket('user', after_reconnect=after_reconnect)
 
     def margin_socket(self):
         """Start a websocket for cross-margin data
